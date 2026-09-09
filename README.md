@@ -1,7 +1,7 @@
 # retcomm-rbengine
 
-Portable **rollback host helpers** for RetComM recomp engines. Sits next to
-[`recomp-net`](https://github.com/TechnicallyComputers/recomp-net): that library
+Portable **rollback host helpers** for Retro recomp engines. Sits next to
+[`recomp-net`](https://github.com/RetroPortingToolKit/recomp-net): that library
 owns the episode FSM, input contract, and wire; this one owns MotK-proven
 **host policy** that every engine needs for playable invent/resim feel.
 
