@@ -1,31 +1,37 @@
 # retcomm-rbengine
 
-Portable **rollback host helpers** for RetComM recomp engines. Sits next to
-[`recomp-net`](https://github.com/TechnicallyComputers/recomp-net): that library
-owns the episode FSM, input contract, and wire; this one owns MotK-proven
-**host policy** that every engine needs for playable invent/resim feel.
+The **offline rollback core** for recomp engines: the pieces of rollback that
+work with netplay compiled out. No dependencies.
 
 | Module | Role |
 |--------|------|
-| `sched` | Admit pacing: invent grace, pcap freeze, cushion rebuild, timesync, auto-D |
-| `input_hist` | Per-slot `RNetRbFrame` history + hold-last / idle invent + promote |
-| `hash_confirm` | Local↔peer FRAME_COMMIT watermark for contract promotes |
 | `snap_ring` | Tick-keyed opaque snapshot ring (+ optional serialize vtable) |
-| `rb_post` | Tip filter for stale `RB_POST` after tip-extend |
-| `mono_ms` | QPC / CLOCK_MONOTONIC helper for `RbeSchedGates.now_ms` |
+| `mono_ms` | QPC / CLOCK_MONOTONIC milliseconds |
 
-## Dependency
+Rewind and run-ahead can link this library on its own. Before the split an
+engine that wanted the snapshot ring without netplay had to compile
+`rbe_snap_ring.c` as a bare source file, because the library linked
+recomp-net and refused to configure without it.
 
-Requires **recomp-net** (rollback on `main`). CMake looks for:
+## What moved to recomp-net
 
-1. `-DRECOMP_NET_ROOT=/path/to/recomp-net`
-2. `../recomp-net` (sibling checkout)
-3. `external/recomp-net`
+Everything that compares against a peer. These now live in
+[`recomp-net`](https://github.com/RetroPortingToolKit/recomp-net) beside the
+session and the episode FSM they serve:
+
+| Was (rbengine) | Now (recomp-net) |
+|--------|------|
+| `retcomm_rbengine/sched.h`, `rbe_sched_*`, `RbeSchedBridge`, `RbeSchedGates` | `recomp_net/sched.h`, `rnet_sched_*`, `RNetSchedBridge`, `RNetSchedGates` |
+| `retcomm_rbengine/hash_confirm.h`, `rbe_hc_*`, `RbeHashConfirm`, `RBE_HC_RING` | `recomp_net/hash_confirm.h`, `rnet_hc_*`, `RNetHashConfirm`, `RNET_HC_RING` |
+| `retcomm_rbengine/input_hist.h`, `rbe_ih_*`, `RbeInputHist`, `RBE_INPUT_HIST_*` | `recomp_net/input_hist.h`, `rnet_ih_*`, `RNetInputHist`, `RNET_INPUT_HIST_*` |
+| `retcomm_rbengine/rb_post.h`, `rbe_rb_peer_post_tip_ok` | `recomp_net/rb_post.h`, `rnet_rb_peer_post_tip_ok` |
+
+The scheduler's `RBE_RB_*` environment knobs kept their names.
 
 ## Build
 
 ```bash
-cmake -S . -B build -DRNET_ENABLE_ICE=OFF
+cmake -S . -B build
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
@@ -35,59 +41,28 @@ add_subdirectory(path/to/retcomm-rbengine)
 target_link_libraries(your_host PRIVATE retcomm_rbengine)
 ```
 
-## Host integration sketch
+## Snapshot ring sketch
 
 ```c
 #include "retcomm_rbengine/retcomm_rbengine.h"
 
-static uint32_t host_now(void *ctx) { (void)ctx; return rbe_mono_ms(); }
-
-RbeSchedBridge br = {
-    .session = &session,
-    .input_delay = &D,
-    .input_prediction = &P,
-    .local_slot = &slot,
-    .gates = { .now_ms = host_now /* + optional FMV/RTT gates */ },
+RbeSnapRing *ring = rbe_snap_ring_create(RBE_SNAP_RING_DEFAULT_DEPTH);
+RbeSnapVTable vt = {
+    .ctx = host,
+    .serialize = host_save_blob,   /* mallocs *out */
+    .deserialize = host_load_blob,
 };
-rbe_sched_bind(&br);
-
-/* Live admit loop (engine owns tip publish / hist / snaps): */
-uint32_t sim = …, wire = rbe_sched_wire_for_sim(sim);
-rnet_session_get_stats(session, &st);
-if (rbe_sched_pre_admit(sim, wire, &st)) { /* stall-present */ return; }
-if (!remote_row) {
-    const char *why;
-    if (rbe_sched_on_remote_miss(slot, sim, wire, &st, P, &why))
-        return; /* wait */
-    rbe_ih_invent_hold_last(&hist, slot, wire, &frame);
-}
-rbe_sched_post_admit(invented);
+rbe_snap_ring_save(ring, tick, &vt);
+rbe_snap_ring_load(ring, load_tick, &vt);
 ```
 
-Game-specific digests, savestate serialize, FMV lockstep, and episode pump stay
-in the engine. Bind them through `RbeSchedGates` / `RbeSnapVTable`.
-
-## Env knobs (scheduler)
-
-| Variable | Effect |
-|----------|--------|
-| `RBE_RB_ZERO_DELAY=1` | Legacy consume wire=`sim+D` (no cushion) |
-| `RBE_RB_INVENT_GRACE_MS` | Floor ms before invent (default 8) |
-| `RBE_RB_GAP1_GRACE_MS` | Flat gap=1 grace override |
-| `RBE_RB_GAP1_INVENT=0` | Wait for tip-stale instead of gap1 invent |
-| `RBE_RB_TIMESYNC=0` | Disable mispredict pacing debt |
-| `RBE_RB_AUTO_DELAY=0` | Disable arrival-driven D controller |
-| `RBE_RB_ADAPT_DELAY=0` | Disable pcap-freeze D bumps |
-| `RBE_CROSS_OS_PACING_DIAG=1` | 1 Hz pacing diag line |
-
-MotK-era `PSX_RB_*` / `PSX_NETPLAY_CROSS_OS_PACING_DIAG` names are still
-honoured when the matching `RBE_*` variable is unset.
+Game-specific savestate serialize stays in the engine.
 
 ## MotK provenance
 
-Lifted from `psxrecomp/runtime` (`psx_netplay_sched`, `netplay_hash_confirm`,
-`netplay_input_hist`, `netplay_snap_ring`, `netplay_rb_post`) with PSX types
-removed. Pad↔frame conversion and boot_state serialize stay in the PSX host.
+Lifted from `psxrecomp/runtime` (`netplay_snap_ring`) with PSX types removed.
+The modules that moved to recomp-net came from `psx_netplay_sched`,
+`netplay_hash_confirm`, `netplay_input_hist` and `netplay_rb_post`.
 
 ## License
 

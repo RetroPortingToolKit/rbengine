@@ -8,7 +8,7 @@ extern "C" {
 #endif
 
 /* Portable monotonic milliseconds (QPC / CLOCK_MONOTONIC). Suitable for
- * RbeSchedGates.now_ms — wrap as `return rbe_mono_ms();`. */
+ * recomp-net's RNetSchedGates.now_ms — wrap as `return rbe_mono_ms();`. */
 uint32_t rbe_mono_ms(void);
 
 #ifdef __cplusplus
