@@ -34,6 +34,7 @@ extern "C" {
 #endif
 
 #define RBE_SNAP_RING_DEFAULT_DEPTH 40u
+#define RBE_SNAP_CAPTURE_API_VERSION 1
 
 typedef struct RbeSnapRing RbeSnapRing;
 
@@ -61,6 +62,21 @@ const uint8_t *rbe_snap_ring_peek(const RbeSnapRing *r, uint32_t tick, size_t *s
 
 /* Serialize via vtable then store. */
 int rbe_snap_ring_save(RbeSnapRing *r, uint32_t tick, const RbeSnapVTable *vt);
+
+/* Serialize into one unpublished spare allocation, then publish atomically.
+ * The callback may realloc *data and update *capacity. On either return value
+ * those fields must describe an owned, free-compatible allocation (or NULL/0).
+ * Success requires 0 < *size <= *capacity. Failure leaves all visible entries
+ * unchanged; the spare allocation is retained for retry/clear/destroy.
+ * No pointer into a visible entry is passed to the callback. On publication,
+ * the replaced/evicted allocation becomes the next spare. At most depth+1
+ * allocations are retained. Peek pointers have the ordinary store lifetime.
+ * Single-owner API: callbacks must not reenter or mutate this ring.
+ */
+typedef int (*RbeSnapCaptureFn)(void *ctx, uint32_t tick, uint8_t **data,
+                                size_t *capacity, size_t *size);
+int rbe_snap_ring_capture(RbeSnapRing *r, uint32_t tick,
+                          RbeSnapCaptureFn capture, void *ctx);
 
 /* Peek + deserialize via vtable. */
 int rbe_snap_ring_load(RbeSnapRing *r, uint32_t tick, const RbeSnapVTable *vt);

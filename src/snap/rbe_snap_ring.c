@@ -8,6 +8,7 @@ typedef struct RbeSnapSlot {
     uint32_t tick;
     uint8_t *data;
     size_t   size;
+    size_t   capacity;
 } RbeSnapSlot;
 
 struct RbeSnapRing {
@@ -15,6 +16,7 @@ struct RbeSnapRing {
     uint32_t     depth;
     uint32_t     count;
     uint32_t     head;
+    RbeSnapSlot  spare;
 };
 
 static void slot_clear(RbeSnapSlot *s)
@@ -22,6 +24,7 @@ static void slot_clear(RbeSnapSlot *s)
     free(s->data);
     s->data = NULL;
     s->size = 0;
+    s->capacity = 0;
     s->tick = 0;
     s->valid = 0;
 }
@@ -73,6 +76,7 @@ void rbe_snap_ring_clear(RbeSnapRing *r)
         return;
     for (i = 0; i < r->depth; i++)
         slot_clear(&r->slots[i]);
+    slot_clear(&r->spare);
     r->count = 0;
     r->head = 0;
 }
@@ -105,6 +109,7 @@ int rbe_snap_ring_store(RbeSnapRing *r, uint32_t tick, uint8_t *data, size_t siz
         free(s->data);
         s->data = data;
         s->size = size;
+        s->capacity = size;
         s->tick = tick;
         s->valid = 1;
         return 1;
@@ -118,6 +123,7 @@ int rbe_snap_ring_store(RbeSnapRing *r, uint32_t tick, uint8_t *data, size_t siz
                 s = &r->slots[idx];
                 s->data = data;
                 s->size = size;
+                s->capacity = size;
                 s->tick = tick;
                 s->valid = 1;
                 r->count++;
@@ -147,6 +153,7 @@ int rbe_snap_ring_store(RbeSnapRing *r, uint32_t tick, uint8_t *data, size_t siz
         free(s->data);
         s->data = data;
         s->size = size;
+        s->capacity = size;
         s->tick = tick;
         s->valid = 1;
         r->head = ((uint32_t)victim + 1u) % r->depth;
@@ -177,6 +184,62 @@ int rbe_snap_ring_save(RbeSnapRing *r, uint32_t tick, const RbeSnapVTable *vt)
         return 0;
     if (!rbe_snap_ring_store(r, tick, data, len))
         return 0;
+    return 1;
+}
+
+int rbe_snap_ring_capture(RbeSnapRing *r, uint32_t tick,
+                          RbeSnapCaptureFn capture, void *ctx)
+{
+    RbeSnapSlot *s;
+    RbeSnapSlot old;
+    size_t size = 0;
+    int idx, existing;
+    uint32_t i;
+    if (!r || !capture)
+        return 0;
+    /* Serialize before selecting/replacing a visible entry. A failure may
+     * change the spare allocation, but cannot damage history. */
+    if (!capture(ctx, tick, &r->spare.data, &r->spare.capacity, &size) ||
+        !r->spare.data || !size || size > r->spare.capacity) {
+        r->spare.size = 0;
+        if (!r->spare.data)
+            r->spare.capacity = 0;
+        return 0;
+    }
+    idx = existing = find_slot(r, tick);
+    if (idx < 0 && r->count < r->depth) {
+        for (i = 0; i < r->depth; i++) {
+            uint32_t candidate = (r->head + i) % r->depth;
+            if (!r->slots[candidate].valid) {
+                idx = (int)candidate;
+                break;
+            }
+        }
+    }
+    if (idx < 0) {
+        uint32_t oldest = 0xffffffffu;
+        for (i = 0; i < r->depth; i++) {
+            if (r->slots[i].valid && r->slots[i].tick <= oldest) {
+                oldest = r->slots[i].tick;
+                idx = (int)i;
+            }
+        }
+    }
+    if (idx < 0)
+        return 0;
+    s = &r->slots[idx];
+    old = *s;
+    *s = r->spare;
+    s->tick = tick;
+    s->size = size;
+    s->valid = 1;
+    r->spare = old;
+    r->spare.valid = 0;
+    r->spare.size = 0;
+    if (!old.valid)
+        r->count++;
+    if (existing < 0)
+        r->head = ((uint32_t)idx + 1u) % r->depth;
     return 1;
 }
 
