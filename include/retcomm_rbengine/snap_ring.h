@@ -38,6 +38,34 @@ extern "C" {
 
 typedef struct RbeSnapRing RbeSnapRing;
 
+#define RBE_SNAP_OBJECT_API_VERSION 1
+/* Optional immutable snapshot representation, e.g. shared pages. The ring does
+ * not flatten or inspect it. logical_size bounds reads, not physical shared-page
+ * storage. The host retains its page/resource accounting and serializer.
+ * Callbacks must not reenter/mutate the ring and release must not throw.
+ */
+typedef struct RbeSnapObject {
+    void *object;
+    size_t logical_size;
+    void (*release)(void *object);
+    int (*read)(const void *object, size_t offset, void *destination, size_t count);
+} RbeSnapObject;
+
+/* Takes object ownership only on success. Construct the entire immutable object
+ * before calling; invalid input/failure leaves prior history and ownership
+ * unchanged. Successful replacement, eviction, drop, clear or destroy releases
+ * exactly once. Do not submit an object already owned by the ring.
+ * Flat and object entries share the same depth/tick/eviction policy. Flat peek
+ * returns NULL for object entries, object peek returns NULL for flat entries.
+ */
+int rbe_snap_ring_store_object(RbeSnapRing *r, uint32_t tick, const RbeSnapObject *object);
+/* Borrowed until this tick is replaced/evicted/dropped, or clear/destroy.
+ * Reads never allocate/flatten and cannot outlive that borrowed lifetime.
+ */
+const RbeSnapObject *rbe_snap_ring_peek_object(const RbeSnapRing *r, uint32_t tick);
+int rbe_snap_ring_read_object(const RbeSnapRing *r, uint32_t tick,
+                             size_t offset, void *destination, size_t count);
+
 /* Optional host serializer. serialize must malloc *out_data (ring takes
  * ownership on success). deserialize restores from a peek'd blob. */
 typedef struct RbeSnapVTable {
