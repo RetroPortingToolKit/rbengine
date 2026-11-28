@@ -59,6 +59,15 @@ if(RBE_BUILD_TESTS)
   endif()
   add_test(NAME capture_ring_test COMMAND capture_ring_test)
 
+  add_executable(object_ring_test tests/object_ring_test.c)
+  target_link_libraries(object_ring_test PRIVATE retcomm_rbengine)
+  if(MSVC)
+    target_compile_options(object_ring_test PRIVATE /UNDEBUG)
+  else()
+    target_compile_options(object_ring_test PRIVATE -UNDEBUG)
+  endif()
+  add_test(NAME object_ring_test COMMAND object_ring_test)
+
 endif()
 
 install(TARGETS retcomm_rbengine ARCHIVE DESTINATION lib LIBRARY DESTINATION lib)
