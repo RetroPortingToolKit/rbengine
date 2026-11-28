@@ -8,6 +8,8 @@ typedef struct RbeSnapSlot {
     uint32_t tick;
     uint8_t *data;
     size_t   size;
+    size_t   capacity;
+    RbeSnapObject object;
 } RbeSnapSlot;
 
 struct RbeSnapRing {
@@ -19,9 +21,13 @@ struct RbeSnapRing {
 
 static void slot_clear(RbeSnapSlot *s)
 {
+    if (s->object.object)
+        s->object.release(s->object.object);
+    memset(&s->object, 0, sizeof(s->object));
     free(s->data);
     s->data = NULL;
     s->size = 0;
+    s->capacity = 0;
     s->tick = 0;
     s->valid = 0;
 }
@@ -92,66 +98,84 @@ int rbe_snap_ring_has(const RbeSnapRing *r, uint32_t tick)
     return find_slot(r, tick) >= 0;
 }
 
+/* Shared target selection for blob capture and immutable-object publication. */
+static int publish_slot(const RbeSnapRing *r, uint32_t tick)
+{
+    int idx = find_slot(r, tick);
+    uint32_t i, oldest = 0xffffffffu;
+    if (idx >= 0) return idx;
+    if (r->count < r->depth) {
+        for (i = 0; i < r->depth; i++) {
+            uint32_t at = (r->head + i) % r->depth;
+            if (!r->slots[at].valid) return (int)at;
+        }
+    }
+    for (i = 0; i < r->depth; i++) {
+        if (r->slots[i].valid && r->slots[i].tick <= oldest) {
+            oldest = r->slots[i].tick;
+            idx = (int)i;
+        }
+    }
+    return idx;
+}
+
+static void published(RbeSnapRing *r, int idx, uint32_t tick, int was_valid, int replacing)
+{
+    r->slots[idx].tick = tick;
+    r->slots[idx].valid = 1;
+    if (!was_valid) r->count++;
+    if (!replacing) r->head = ((uint32_t)idx + 1u) % r->depth;
+}
+
 int rbe_snap_ring_store(RbeSnapRing *r, uint32_t tick, uint8_t *data, size_t size)
 {
-    int existing;
+    int idx, was_valid, replacing;
     RbeSnapSlot *s;
-    if (!r || !data || !size)
-        return 0;
+    if (!r || !data || !size) return 0;
+    idx = publish_slot(r, tick);
+    if (idx < 0) return 0;
+    s = &r->slots[idx];
+    was_valid = s->valid;
+    replacing = s->valid && s->tick == tick;
+    slot_clear(s);
+    s->data = data;
+    s->size = s->capacity = size;
+    published(r, idx, tick, was_valid, replacing);
+    return 1;
+}
 
-    existing = find_slot(r, tick);
-    if (existing >= 0) {
-        s = &r->slots[existing];
-        free(s->data);
-        s->data = data;
-        s->size = size;
-        s->tick = tick;
-        s->valid = 1;
-        return 1;
-    }
+int rbe_snap_ring_store_object(RbeSnapRing *r, uint32_t tick, const RbeSnapObject *object)
+{
+    int idx, was_valid, replacing;
+    RbeSnapObject incoming;
+    RbeSnapSlot *s;
+    if (!r || !object || !object->object || !object->logical_size ||
+        !object->release || !object->read) return 0;
+    incoming = *object; /* object may be a caller-owned temporary descriptor. */
+    idx = publish_slot(r, tick);
+    if (idx < 0) return 0;
+    s = &r->slots[idx];
+    was_valid = s->valid;
+    replacing = s->valid && s->tick == tick;
+    slot_clear(s);
+    s->object = incoming;
+    published(r, idx, tick, was_valid, replacing);
+    return 1;
+}
 
-    if (r->count < r->depth) {
-        uint32_t i;
-        for (i = 0; i < r->depth; i++) {
-            uint32_t idx = (r->head + i) % r->depth;
-            if (!r->slots[idx].valid) {
-                s = &r->slots[idx];
-                s->data = data;
-                s->size = size;
-                s->tick = tick;
-                s->valid = 1;
-                r->count++;
-                r->head = (idx + 1u) % r->depth;
-                return 1;
-            }
-        }
-    }
+const RbeSnapObject *rbe_snap_ring_peek_object(const RbeSnapRing *r, uint32_t tick)
+{
+    int idx = find_slot(r, tick);
+    return idx >= 0 && r->slots[idx].object.object ? &r->slots[idx].object : NULL;
+}
 
-    {
-        uint32_t i;
-        int victim = -1;
-        uint32_t oldest = 0xffffffffu;
-        for (i = 0; i < r->depth; i++) {
-            if (!r->slots[i].valid)
-                continue;
-            if (r->slots[i].tick <= oldest) {
-                oldest = r->slots[i].tick;
-                victim = (int)i;
-            }
-        }
-        if (victim < 0) {
-            free(data);
-            return 0;
-        }
-        s = &r->slots[victim];
-        free(s->data);
-        s->data = data;
-        s->size = size;
-        s->tick = tick;
-        s->valid = 1;
-        r->head = ((uint32_t)victim + 1u) % r->depth;
-        return 1;
-    }
+int rbe_snap_ring_read_object(const RbeSnapRing *r, uint32_t tick,
+                             size_t offset, void *destination, size_t count)
+{
+    const RbeSnapObject *object = rbe_snap_ring_peek_object(r, tick);
+    if (!object || offset > object->logical_size || count > object->logical_size - offset ||
+        (!destination && count)) return 0;
+    return !count || object->read(object->object, offset, destination, count);
 }
 
 const uint8_t *rbe_snap_ring_peek(const RbeSnapRing *r, uint32_t tick, size_t *size_out)
